@@ -1222,3 +1222,66 @@ func TestStreamResetWrite(t *testing.T) {
 	stream.Reset()
 	<-wait
 }
+
+func TestStreamZero(t *testing.T) {
+	timer := time.AfterFunc(10*time.Second, func() {
+		// This is really the *only* reliable way to set a timeout on
+		// this test...
+		// Don't add *anything* to this function. The go scheduler acts
+		// a bit funny when it encounters a deadlock...
+		panic("timeout")
+	})
+	defer timer.Stop()
+
+	client, server := testClientServer()
+	defer client.Close()
+	defer server.Close()
+
+	stream, err := client.OpenStream()
+
+	step := make(chan struct{})
+	go func() {
+		stream, err := server.AcceptStream()
+		if err != nil {
+			t.Errorf("err: %v", err)
+		}
+
+		<-step
+
+		n, err := stream.Write(nil)
+		if n != 0 {
+			t.Errorf("should not have written any bytes")
+		}
+		if err != nil {
+			t.Errorf("should not have failed to write 0 bytes")
+		}
+		stream.Close()
+		n, err = stream.Write(nil)
+		if n != 0 {
+			t.Errorf("should not have written any bytes")
+		}
+		if err == nil {
+			t.Errorf("should have failed to write 0 bytes on a closed stream")
+		}
+		step <- struct{}{}
+	}()
+
+	n, err := stream.Read(nil)
+	if n != 0 {
+		t.Errorf("should not have read any bytes")
+	}
+	if err != nil {
+		t.Errorf("should not have failed to read 0 bytes")
+	}
+
+	step <- struct{}{}
+	<-step
+	stream.Read(nil)
+	if n != 0 {
+		t.Errorf("should not have read any bytes")
+	}
+	if err != nil {
+		t.Errorf("should have failed to read 0 bytes on a remote-closed stream")
+	}
+	stream.Close()
+}
