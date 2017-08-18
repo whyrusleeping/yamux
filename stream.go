@@ -104,6 +104,11 @@ START:
 	}
 	s.stateLock.Unlock()
 
+	// Don't wait for zero bytes.
+	if len(b) == 0 {
+		return 0, nil
+	}
+
 	// If there is no data available, block
 	s.recvLock.Lock()
 	if s.recvBuf == nil || s.recvBuf.Len() == 0 {
@@ -138,10 +143,25 @@ WAIT:
 	}
 }
 
+func (s *Stream) writeState() error {
+	s.stateLock.Lock()
+	defer s.stateLock.Unlock()
+	switch s.state {
+	case streamLocalClose, streamClosed:
+		return ErrStreamClosed
+	case streamReset:
+		return ErrConnectionReset
+	}
+	return nil
+}
+
 // Write is used to write to the stream
 func (s *Stream) Write(b []byte) (n int, err error) {
 	s.sendLock.Lock()
 	defer s.sendLock.Unlock()
+	if len(b) == 0 {
+		return 0, s.writeState()
+	}
 	total := 0
 	for total < len(b) {
 		n, err := s.write(b[total:])
@@ -160,18 +180,9 @@ func (s *Stream) write(b []byte) (n int, err error) {
 	var max uint32
 	var body io.Reader
 START:
-	s.stateLock.Lock()
-	switch s.state {
-	case streamLocalClose:
-		fallthrough
-	case streamClosed:
-		s.stateLock.Unlock()
-		return 0, ErrStreamClosed
-	case streamReset:
-		s.stateLock.Unlock()
-		return 0, ErrConnectionReset
+	if err := s.writeState(); err != nil {
+		return 0, err
 	}
-	s.stateLock.Unlock()
 
 	// If there is no data available, block
 	window := atomic.LoadUint32(&s.sendWindow)
