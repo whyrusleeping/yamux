@@ -87,11 +87,10 @@ type Session struct {
 // sendReady is used to either mark a stream as ready
 // or to directly send a header
 type sendReady struct {
-	Hdr          []byte
-	Body         io.Reader
-	Err          chan error
-	Deadline     time.Time
-	TimerHandoff chan struct{}
+	Hdr      []byte
+	Body     io.Reader
+	Err      chan error
+	Deadline time.Time
 }
 
 // newSession is used to construct a new session
@@ -360,27 +359,23 @@ func (s *Session) waitForSend(hdr header, body io.Reader) error {
 // potential shutdown. Since there's the expectation that sends can happen
 // in a timely manner, we enforce the connection write timeout here.
 func (s *Session) waitForSendErr(hdr header, body io.Reader, errCh chan error) error {
-	var (
-		timer, cancelFn = pooledTimer(s.config.ConnectionWriteTimeout)
+	// deadline captures the absolute deadline for this write
+	// at the instant it was performed. We have two outcomes to cover:
+	// 1. deadline expiring before we manage to publish to sendCh (buffered),
+	//    controlled by the above timer.
+	// 2. deadline expiring after the above, and during IO. This is controlled
+	//    by the send* methods, which need to know the original deadline.
+	deadline := time.Now().Add(s.config.ConnectionWriteTimeout)
 
-		// this is important because it captures the absolute deadline for this write
-		// at the instant it was performed. We have two outcomes to cover:
-		// 1. deadline expiring before we manage to publish to sendCh (buffered),
-		//    controlled by the above timer.
-		// 2. deadline expiring after the above, and during IO. This is controlled
-		//    by the send* methods, which need to know the original deadline.
-		absDeadline = time.Now().Add(s.config.ConnectionWriteTimeout)
-		once        sync.Once
-	)
+	timer, cancelFn := pooledTimer(s.config.ConnectionWriteTimeout)
+	defer cancelFn()
 
-	defer once.Do(cancelFn)
-
-	ready := sendReady{Hdr: hdr, Body: body, Err: errCh, Deadline: absDeadline}
+	ready := sendReady{Hdr: hdr, Body: body, Err: errCh, Deadline: deadline}
 	select {
 	case s.sendCh <- ready:
 		if s.netconn != nil {
-			// if we have a net conn, the write timer has been handed off, so cancel it now
-			once.Do(cancelFn)
+			// if we have a net conn, the write timer has been handed off, so cancel it now.
+			cancelFn()
 		}
 	case <-s.shutdownCh:
 		return ErrSessionShutdown
@@ -404,11 +399,10 @@ func (s *Session) waitForSendErr(hdr header, body io.Reader, errCh chan error) e
 func (s *Session) sendNoWait(hdr header) error {
 	var (
 		timer, cancelFn = pooledTimer(s.config.ConnectionWriteTimeout)
-		// even if the caller is not waiting, we must cater for IO timeouts
+		// even if the caller is not waiting, we must account for IO timeouts
 		// for correctness.
 		deadline = time.Now().Add(s.config.ConnectionWriteTimeout)
 	)
-
 	defer cancelFn()
 
 	select {
@@ -425,122 +419,99 @@ func pooledTimer(d time.Duration) (*time.Timer, func()) {
 	t := timerPool.Get()
 	timer := t.(*time.Timer)
 	timer.Reset(d)
+	var once sync.Once
 	cancelFn := func() {
-		timer.Stop()
-		select {
-		case <-timer.C:
-		default:
-		}
-		timerPool.Put(t)
+		once.Do(func() {
+			timer.Stop()
+			select {
+			case <-timer.C:
+			default:
+			}
+			timerPool.Put(t)
+		})
 	}
 	return timer, cancelFn
 }
 
+func (s *Session) writeMessage(errCh chan error, readers ...io.Reader) (int64, error) {
+	n, err := io.Copy(s.conn, io.MultiReader(readers...))
+	if err != nil {
+		s.logger.Printf("[ERR] yamux: Failed to write message: %v", err)
+	}
+	asyncSendErr(errCh, err)
+	return n, err
+}
+
 func (s *Session) sendConn() {
-	var zero time.Time
 	for {
 		select {
 		case ready := <-s.sendCh:
-			if ready.Deadline != zero && ready.Deadline.Before(time.Now()) {
+			deadline := ready.Deadline
+			if time.Now().After(deadline) {
+				// this send has expired; the caller already received a timeout.
 				continue
 			}
+			// Set the deadline on the connection.
+			s.netconn.SetWriteDeadline(deadline)
 
-			s.netconn.SetWriteDeadline(ready.Deadline)
-
-			// Send a header if ready
+			mr := make([]io.Reader, 0, 2)
 			if ready.Hdr != nil {
-				_, err := io.Copy(s.conn, bytes.NewReader(ready.Hdr))
-				if err != nil {
-					s.logger.Printf("[ERR] yamux: Failed to write header: %v", err)
-					asyncSendErr(ready.Err, err)
-					s.exitErr(err)
-					return
-				}
+				mr = append(mr, bytes.NewReader(ready.Hdr))
 			}
-
-			// Send data from a body if given
 			if ready.Body != nil {
-				_, err := io.Copy(s.conn, ready.Body)
-				if err != nil {
-					s.logger.Printf("[ERR] yamux: Failed to write body: %v", err)
-					asyncSendErr(ready.Err, err)
-					s.exitErr(err)
-					return
-				}
+				mr = append(mr, ready.Body)
 			}
-
-			// No error, successful send
-			asyncSendErr(ready.Err, nil)
+			// if we had a partial write, the connection is unhealthy, so fail.
+			if n, err := s.writeMessage(ready.Err, mr...); err != nil && n > 0 {
+				s.exitErr(err)
+				return
+			}
 		case <-s.shutdownCh:
 			return
 		}
 	}
 }
 
-type readable func(p []byte) (int, error)
+type yieldingReadable func(p []byte) (int, error)
 
-func (r readable) Read(p []byte) (int, error) { return r(p) }
+func (r yieldingReadable) Read(p []byte) (int, error) { return r(p) }
+
+func newYieldingReadable(reader io.Reader, deadline time.Time) yieldingReadable {
+	f := func(p []byte) (int, error) {
+		// Tries to yield if the deadline has elapsed.
+		if time.Now().After(deadline) {
+			return 0, errors.New("yamux: timeout while writing message")
+		}
+		return reader.Read(p)
+	}
+	return f
+}
 
 func (s *Session) sendFallback() {
-	var (
-		zero    time.Time
-		hdrCopy = make([]byte, headerSize)
-	)
-
 	for {
 		select {
 		case ready := <-s.sendCh:
-			if ready.Deadline != zero && time.Now().After(ready.Deadline) {
+			deadline := ready.Deadline
+			if time.Now().After(deadline) {
 				// this send has expired; the caller already received a timeout.
 				continue
 			}
-
-			// Send a header if ready
+			mr := make([]io.Reader, 0, 2)
 			if ready.Hdr != nil {
-				copy(hdrCopy, ready.Hdr)
-
-				sent := 0
-				for sent < len(hdrCopy) {
-					// Tries to yield if the deadline has elapsed.
-					if time.Now().After(ready.Deadline) {
-						s.logger.Println("[ERR] yamux: Timeout while writing header")
-						err := errors.New("yamux: timeout while writing header")
-						asyncSendErr(ready.Err, err)
-						s.exitErr(err)
-						return
-					}
-
-					n, err := s.conn.Write(hdrCopy[sent:])
-					if err != nil {
-						s.logger.Printf("[ERR] yamux: Failed to write header: %v", err)
-						asyncSendErr(ready.Err, err)
-						s.exitErr(err)
-						return
-					}
-					sent += n
-				}
+				mr = append(mr, newYieldingReadable(bytes.NewReader(ready.Hdr), deadline))
 			}
-
-			// Send data from a body if given.
 			if ready.Body != nil {
-				_, err := io.Copy(s.conn, readable(func(p []byte) (int, error) {
-					// Tries to yield if the deadline has elapsed.
-					if time.Now().After(ready.Deadline) {
-						return 0, errors.New("yamux: timeout while writing body")
-					}
-					return ready.Body.Read(p)
-				}))
-
-				if err != nil {
-					s.logger.Printf("[ERR] yamux: Failed to write body: %v", err)
-					asyncSendErr(ready.Err, err)
-					s.exitErr(err)
-					return
-				}
+				mr = append(mr, newYieldingReadable(ready.Body, deadline))
 			}
-
-			// No error, successful send
-			asyncSendErr(ready.Err, nil)
+			// if we had a partial write, the connection is unhealthy, but we can't kill it
+			// because the 'yielding reader' is best-effort basis, and completely non-deterministic.
+			// We don't know when the write is actually interrupted, so closing the connection now
+			// would be non-orderly. Hence we just log.
+			//
+			// NOTE: sendFallback() is likely not used in production, only in tests.
+			if n, err := s.writeMessage(ready.Err, mr...); err != nil && n > 0 {
+				s.logger.Printf("[ERR] yamux: Partial write, connection may be corrupted. bytes written: %d, error: %v", n, err)
+			}
 		case <-s.shutdownCh:
 			return
 		}

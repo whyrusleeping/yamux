@@ -1484,9 +1484,6 @@ func TestResetAfterTimeout(t *testing.T) {
 		t.Error("expected session to be closed following the timeout")
 	}
 
-	// try to send another message.
-	n, err = s.Write(make([]byte, 1024*1024))
-
 	if err = s.Reset(); err == nil {
 		t.Error("expected stream reset to fail")
 	} else if !strings.Contains(err.Error(), "session shutdown") {
