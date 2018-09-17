@@ -433,12 +433,11 @@ func pooledTimer(d time.Duration) (*time.Timer, func()) {
 	return timer, cancelFn
 }
 
-func (s *Session) writeMessage(errCh chan error, readers ...io.Reader) (int64, error) {
+func (s *Session) writeMessage(readers ...io.Reader) (int64, error) {
 	n, err := io.Copy(s.conn, io.MultiReader(readers...))
 	if err != nil {
 		s.logger.Printf("[ERR] yamux: Failed to write message: %v", err)
 	}
-	asyncSendErr(errCh, err)
 	return n, err
 }
 
@@ -462,10 +461,15 @@ func (s *Session) sendConn() {
 				mr = append(mr, ready.Body)
 			}
 			// if we had a partial write, the connection is unhealthy, so fail.
-			if n, err := s.writeMessage(ready.Err, mr...); err != nil && n > 0 {
+			// otherwise, just propagate back the error.
+			n, err := s.writeMessage(mr...)
+			if err != nil && n > 0 {
+				err = fmt.Errorf("%v; session closed", err)
+				asyncSendErr(ready.Err, err)
 				s.exitErr(err)
 				return
 			}
+			asyncSendErr(ready.Err, err)
 		case <-s.shutdownCh:
 			return
 		}
@@ -509,9 +513,11 @@ func (s *Session) sendFallback() {
 			// would be non-orderly. Hence we just log.
 			//
 			// NOTE: sendFallback() is likely not used in production, only in tests.
-			if n, err := s.writeMessage(ready.Err, mr...); err != nil && n > 0 {
+			n, err := s.writeMessage(mr...)
+			if err != nil && n > 0 {
 				s.logger.Printf("[ERR] yamux: Partial write, connection may be corrupted. bytes written: %d, error: %v", n, err)
 			}
+			asyncSendErr(ready.Err, err)
 		case <-s.shutdownCh:
 			return
 		}

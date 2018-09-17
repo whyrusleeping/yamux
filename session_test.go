@@ -1469,17 +1469,12 @@ func TestResetAfterTimeout(t *testing.T) {
 	if s, err = sess.OpenStream(); err != nil {
 		t.Fatal(err)
 	}
-
 	if s.Session().IsClosed() {
 		t.Error("expected session to be open")
 	}
-
-	n, err := s.Write(make([]byte, 1024*1024))
-
-	if err == nil || !strings.Contains(err.Error(), "timeout") {
+	if n, err := s.Write(make([]byte, 1024*1024)); err == nil || !strings.Contains(err.Error(), "timeout") {
 		t.Errorf("expected write to timeout, written bytes: %d, err: %v", n, err)
 	}
-
 	if !s.Session().IsClosed() {
 		t.Error("expected session to be closed following the timeout")
 	}
