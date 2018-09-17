@@ -6,6 +6,7 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
+	"net"
 	"reflect"
 	"runtime"
 	"strings"
@@ -1408,4 +1409,87 @@ func TestStreamResetRead(t *testing.T) {
 	time.Sleep(1 * time.Second)
 	stream.Reset()
 	wc.Wait()
+}
+
+func TestResetAfterTimeout(t *testing.T) {
+	config := testConf()
+	// 8mb; we want the yamux window size to be big so that we're stalled by TCP's congestion control, not by yamux
+	// thus causing a connection timeout
+	config.MaxStreamWindowSize = 8 * 1024 * 1024
+	config.ConnectionWriteTimeout = 1 * time.Second
+	config.EnableKeepAlive = false
+
+	l, err := net.ListenTCP("tcp", nil)
+	if err != nil {
+		t.Error(err)
+	}
+
+	defer l.Close()
+	wg := new(sync.WaitGroup)
+	wg.Add(1)
+	defer wg.Done()
+
+	bufCh := make(chan struct{})
+
+	// Server-side: a ghost socket that accepts connections and sets a tiny read buffer,
+	// forcing TCP congestion control to stall the window.
+	go func() {
+		if conn, err := l.AcceptTCP(); err != nil {
+			t.Fatal(err)
+		} else {
+			if err = conn.SetReadBuffer(1); err != nil {
+				t.Fatal(err)
+			}
+			bufCh <- struct{}{}
+			wg.Wait()
+		}
+	}()
+
+	var addr *net.TCPAddr
+	var conn *net.TCPConn
+	var sess *Session
+	var s *Stream
+
+	// Client-side: set a tiny write buffer to force the application (yamux) to wait.
+	if addr, err = net.ResolveTCPAddr("tcp", l.Addr().String()); err != nil {
+		t.Fatal(err)
+	}
+	if conn, err = net.DialTCP("tcp", nil, addr); err != nil {
+		t.Fatal(err)
+	}
+	if err = conn.SetWriteBuffer(1); err != nil {
+		t.Fatal(err)
+	}
+
+	<-bufCh
+
+	if sess, err = Client(conn, config); err != nil {
+		t.Fatal(err)
+	}
+	if s, err = sess.OpenStream(); err != nil {
+		t.Fatal(err)
+	}
+
+	if s.Session().IsClosed() {
+		t.Error("expected session to be open")
+	}
+
+	n, err := s.Write(make([]byte, 1024*1024))
+
+	if err == nil || !strings.Contains(err.Error(), "timeout") {
+		t.Errorf("expected write to timeout, written bytes: %d, err: %v", n, err)
+	}
+
+	if !s.Session().IsClosed() {
+		t.Error("expected session to be closed following the timeout")
+	}
+
+	// try to send another message.
+	n, err = s.Write(make([]byte, 1024*1024))
+
+	if err = s.Reset(); err == nil {
+		t.Error("expected stream reset to fail")
+	} else if !strings.Contains(err.Error(), "session shutdown") {
+		t.Error("expected session to be shut down")
+	}
 }
