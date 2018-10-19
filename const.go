@@ -63,7 +63,7 @@ var (
 
 const (
 	// protoVersion is the only version we support
-	protoVersion uint8 = 0
+	protoVersion uint8 = 1
 )
 
 const (
@@ -149,6 +149,10 @@ func (h header) StreamID() uint32 {
 
 func (h header) Length() uint32 {
 	return binary.BigEndian.Uint32(h[8:12])
+}
+
+func (h header) TranslateID() {
+	binary.BigEndian.PutUint32(h[4:8], translateID(h.StreamID()))
 }
 
 func (h header) String() string {

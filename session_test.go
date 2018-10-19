@@ -80,55 +80,9 @@ func testClientServer() (*Session, *Session) {
 
 func testClientServerConfig(conf *Config) (*Session, *Session) {
 	conn1, conn2 := testConn()
-	client, _ := Client(conn1, conf)
-	server, _ := Server(conn2, conf)
+	client, _ := NewSession(conn1, conf)
+	server, _ := NewSession(conn2, conf)
 	return client, server
-}
-
-func TestClientClient(t *testing.T) {
-	conf := testConf()
-	conn1, conn2 := testConn()
-	client1, _ := Client(conn1, conf)
-	client2, _ := Client(conn2, conf)
-	defer client1.Close()
-	defer client2.Close()
-
-	client1.OpenStream()
-	_, err := client2.AcceptStream()
-	if err == nil {
-		t.Fatalf("should have failed to open a stream with two clients")
-	}
-	client2.OpenStream()
-	_, err = client1.AcceptStream()
-	if err == nil {
-		t.Fatalf("should have failed to open a stream with two clients")
-	}
-	if !client1.IsClosed() || !client2.IsClosed() {
-		t.Fatalf("sessions should have been closed by errors")
-	}
-}
-
-func TestServerServer(t *testing.T) {
-	conf := testConf()
-	conn1, conn2 := testConn()
-	server1, _ := Server(conn1, conf)
-	server2, _ := Server(conn2, conf)
-	defer server1.Close()
-	defer server2.Close()
-
-	server1.OpenStream()
-	_, err := server2.AcceptStream()
-	if err == nil {
-		t.Fatalf("should have failed to open a stream with two servers")
-	}
-	server2.OpenStream()
-	_, err = server1.AcceptStream()
-	if err == nil {
-		t.Fatalf("should have failed to open a stream with two servers")
-	}
-	if !server1.IsClosed() || !server2.IsClosed() {
-		t.Fatalf("sessions should have been closed by errors")
-	}
 }
 
 func TestPing(t *testing.T) {
@@ -257,7 +211,7 @@ func TestAccept(t *testing.T) {
 		if err != nil {
 			t.Fatalf("err: %v", err)
 		}
-		if id := stream.StreamID(); id != 1 {
+		if id := translateID(stream.StreamID()); id != 1 {
 			t.Fatalf("bad: %v", id)
 		}
 		if err := stream.Close(); err != nil {
@@ -271,7 +225,7 @@ func TestAccept(t *testing.T) {
 		if err != nil {
 			t.Fatalf("err: %v", err)
 		}
-		if id := stream.StreamID(); id != 2 {
+		if id := translateID(stream.StreamID()); id != 1 {
 			t.Fatalf("bad: %v", id)
 		}
 		if err := stream.Close(); err != nil {
@@ -285,7 +239,7 @@ func TestAccept(t *testing.T) {
 		if err != nil {
 			t.Fatalf("err: %v", err)
 		}
-		if id := stream.StreamID(); id != 2 {
+		if id := stream.StreamID(); id != 1 {
 			t.Fatalf("bad: %v", id)
 		}
 		if err := stream.Close(); err != nil {
@@ -847,10 +801,10 @@ func TestKeepAlive_Timeout(t *testing.T) {
 	clientConf := testConf()
 	clientConf.ConnectionWriteTimeout = time.Hour // We're testing keep alives, not connection writes
 	clientConf.EnableKeepAlive = false            // Just test one direction, so it's deterministic who hangs up on whom
-	client, _ := Client(conn1, clientConf)
+	client, _ := NewSession(conn1, clientConf)
 	defer client.Close()
 
-	server, _ := Server(conn2, testConf())
+	server, _ := NewSession(conn2, testConf())
 	defer server.Close()
 
 	_ = captureLogs(client) // Client logs aren't part of the test
@@ -1547,7 +1501,7 @@ func TestConnTimeoutPartialWriteClosesConnection(t *testing.T) {
 
 	<-bufferSetCh
 
-	if sess, err = Client(conn, config); err != nil {
+	if sess, err = NewSession(conn, config); err != nil {
 		t.Fatal(err)
 	}
 	if s, err = sess.OpenStream(); err != nil {

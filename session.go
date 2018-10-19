@@ -69,9 +69,6 @@ type Session struct {
 	// between stream registration and stream shutdown
 	recvDoneCh chan struct{}
 
-	// client is true if we're the client and our stream IDs should be odd.
-	client bool
-
 	// shutdown is used to safely close a session
 	shutdown     bool
 	shutdownErr  error
@@ -94,30 +91,25 @@ const (
 )
 
 // newSession is used to construct a new session
-func newSession(config *Config, conn io.ReadWriteCloser, client bool, readBuf int) *Session {
+func newSession(config *Config, conn io.ReadWriteCloser, readBuf int) *Session {
 	var reader io.Reader = conn
 	if readBuf > 0 {
 		reader = bufio.NewReaderSize(reader, readBuf)
 	}
 	s := &Session{
-		config:     config,
-		client:     client,
-		logger:     log.New(config.LogOutput, "", log.LstdFlags),
-		conn:       conn,
-		reader:     reader,
-		pings:      make(map[uint32]chan struct{}),
-		streams:    make(map[uint32]*Stream),
-		inflight:   make(map[uint32]struct{}),
-		synCh:      make(chan struct{}, config.AcceptBacklog),
-		acceptCh:   make(chan *Stream, config.AcceptBacklog),
-		sendCh:     make(chan *sendReady, 64),
-		recvDoneCh: make(chan struct{}),
-		shutdownCh: make(chan struct{}),
-	}
-	if client {
-		s.nextStreamID = 1
-	} else {
-		s.nextStreamID = 2
+		config:       config,
+		logger:       log.New(config.LogOutput, "", log.LstdFlags),
+		conn:         conn,
+		reader:       reader,
+		pings:        make(map[uint32]chan struct{}),
+		streams:      make(map[uint32]*Stream),
+		inflight:     make(map[uint32]struct{}),
+		synCh:        make(chan struct{}, config.AcceptBacklog),
+		acceptCh:     make(chan *Stream, config.AcceptBacklog),
+		sendCh:       make(chan *sendReady, 64),
+		recvDoneCh:   make(chan struct{}),
+		shutdownCh:   make(chan struct{}),
+		nextStreamID: 1,
 	}
 	go s.recv()
 	go s.send()
@@ -179,10 +171,10 @@ func (s *Session) OpenStream() (*Stream, error) {
 GET_ID:
 	// Get an ID, and check for stream exhaustion
 	id := atomic.LoadUint32(&s.nextStreamID)
-	if id >= math.MaxUint32-1 {
+	if id >= (math.MaxUint32>>1)-1 {
 		return nil, ErrStreamsExhausted
 	}
-	if !atomic.CompareAndSwapUint32(&s.nextStreamID, id, id+2) {
+	if !atomic.CompareAndSwapUint32(&s.nextStreamID, id, id+1) {
 		goto GET_ID
 	}
 
@@ -513,6 +505,8 @@ func (s *Session) recvLoop() error {
 			return ErrInvalidVersion
 		}
 
+		hdr.TranslateID()
+
 		mt := hdr.MsgType()
 		if mt < typeData || mt > typeGoAway {
 			return ErrInvalidMsgType
@@ -624,12 +618,12 @@ func (s *Session) handleGoAway(hdr header) error {
 	return nil
 }
 
+func translateID(id uint32) uint32 {
+	return id ^ (1 << 31)
+}
+
 // incomingStream is used to create a new incoming stream
 func (s *Session) incomingStream(id uint32) error {
-	if s.client != (id%2 == 0) {
-		s.logger.Printf("[ERR] yamux: both endpoints are clients")
-		return fmt.Errorf("both yamux endpoints are clients")
-	}
 	// Reject immediately if we are doing a go away
 	if atomic.LoadInt32(&s.localGoAway) == 1 {
 		hdr := header(make([]byte, headerSize))

@@ -5,7 +5,7 @@ import (
 )
 
 func TestConst(t *testing.T) {
-	if protoVersion != 0 {
+	if protoVersion != 1 {
 		t.Fatalf("bad: %v", protoVersion)
 	}
 
