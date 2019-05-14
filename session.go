@@ -369,7 +369,7 @@ func pooledTimer(d time.Duration) (*time.Timer, func()) {
 //  * `nil` if (a) this is a control message (ping, go away, window update, etc.), or (b) if the user
 //    has not set a write deadline on the stream.
 //  * non-`nil` if (a) this is a user-requested write, and (b) the stream has a write deadline.
-func (s *Session) waitForSendErr(hdr header, body io.Reader, errCh chan error, timeout <-chan time.Time) error {
+func (s *Session) waitForSendErr(hdr header, body io.Reader, errCh chan error, deadline *deadline) error {
 	select {
 	case <-s.shutdownCh:
 		return ErrSessionShutdown
@@ -378,11 +378,14 @@ func (s *Session) waitForSendErr(hdr header, body io.Reader, errCh chan error, t
 
 	var connWriteTimerCh <-chan time.Time
 
-	if timeout == nil {
+	var deadlineCh <-chan time.Time
+	if deadline == nil {
 		// fall back to the connection write timeout.
 		t, cancelFn := pooledTimer(s.config.ConnectionWriteTimeout)
 		defer cancelFn()
 		connWriteTimerCh = t.C
+	} else {
+		deadlineCh = deadline.C
 	}
 
 	ready := &sendReady{Hdr: hdr, Body: body, Err: errCh, Stage: stageInitial}
@@ -391,7 +394,7 @@ func (s *Session) waitForSendErr(hdr header, body io.Reader, errCh chan error, t
 	case <-s.shutdownCh:
 		return ErrSessionShutdown
 	case s.sendCh <- ready:
-	case <-timeout:
+	case <-deadlineCh:
 		// we timed out before the write went across the channel. keep connection open.
 		return ErrTimeout
 	case <-connWriteTimerCh:
@@ -407,7 +410,8 @@ WAIT:
 		return ErrSessionShutdown
 	case err := <-errCh:
 		return err
-	case <-timeout:
+	case <-deadlineCh:
+		deadline.setExpired()
 		// A deadline had been set on the stream. Try to abort the write if it hasn't started.
 		if atomic.CompareAndSwapUint32(&ready.Stage, stageInitial, stageFinal) {
 			// If successful, the connection stays alive.
@@ -420,7 +424,7 @@ WAIT:
 		goto WAIT
 	case <-connWriteTimerCh:
 		// The connection write timeout has fired. Try to cancel the write only if this was a fallback timer.
-		if timeout == nil && atomic.CompareAndSwapUint32(&ready.Stage, stageInitial, stageFinal) {
+		if deadline == nil && atomic.CompareAndSwapUint32(&ready.Stage, stageInitial, stageFinal) {
 			return ErrTimeout
 		}
 		// Terminate the connection.
